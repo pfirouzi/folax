@@ -23,7 +23,7 @@ class NeoHookeMechanicalLoss(FiniteElementLoss):
         self.v = self.loss_settings["material_dict"]["poisson_ratio"]  
         
         if self.dim == 2:
-            self.material_model = NeoHookianModel2D()
+            self.material_model = NeoHookianModel2DAD()
             self.CalculateNMatrix = self.CalculateNMatrix2D
             self.CalculateKinematics = self.CalculateKinematics2D
             if self.element_type == "quad":
@@ -35,7 +35,7 @@ class NeoHookeMechanicalLoss(FiniteElementLoss):
                 self.body_force = jnp.array(self.loss_settings["body_foce"])
         
         if self.dim == 3:
-            self.material_model = NeoHookianModel()
+            self.material_model = NeoHookianModelAD()
             self.CalculateNMatrix = self.CalculateNMatrix3D
             self.CalculateKinematics = self.CalculateKinematics3D   
             if self.element_type == "tetra":
@@ -262,18 +262,25 @@ class NeoHookeMechanicalLoss(FiniteElementLoss):
             e_at_gauss = jnp.dot(N_vec, de.squeeze())
             k_at_gauss = e_at_gauss / (3 * (1 - 2*self.v))
             mu_at_gauss = e_at_gauss / (2 * (1 + self.v))
+            lambda_at_gauss = e_at_gauss*self.v/((1+self.v)*(1-2*self.v))
 
-            H,F,B = self.CalculateKinematics(DN_DX_T,uvwe)
-            xsi,S,C = self.material_model.evaluate(F,k_at_gauss,mu_at_gauss)
-            gp_geo_stiffness = self.CalculateGeometricStiffness(DN_DX_T,S)
+            def residual(uvwe):
+                _,F,B = self.CalculateKinematics(DN_DX_T,uvwe)
+                c = jnp.dot(F.T,F)
+                _,S,_ = self.material_model.evaluate(c,k=k_at_gauss,mu=mu_at_gauss,lambda_=lambda_at_gauss)
+                return jnp.dot(B.T,S)
             
+            dres_du_fn = jax.jacfwd(residual)
+
+            _,F,_ = self.CalculateKinematics(DN_DX_T,uvwe)
+            c = jnp.dot(F.T,F)
+            xsi,_,_ = self.material_model.evaluate(c,k=k_at_gauss,mu=mu_at_gauss,lambda_=lambda_at_gauss)
             
-            gp_stiffness = gp_weight * detJ * (B.T @ C @ B)
-            gp_geo_stiffness = gp_weight * detJ * gp_geo_stiffness  # will be added to gp_stiffness
+            gp_stiffness = gp_weight * detJ * dres_du_fn(uvwe).squeeze()
             gp_f = gp_weight * detJ * N_mat.T @ self.body_force
-            gp_fint = gp_weight * detJ * jnp.dot(B.T,S)
+            gp_fint = gp_weight * detJ * residual(uvwe)
             gp_energy = gp_weight * detJ * xsi
-            return gp_energy,gp_stiffness + gp_geo_stiffness,gp_f,gp_fint
+            return gp_energy,gp_stiffness ,gp_f,gp_fint
 
         gp_points,gp_weights = self.fe_element.GetIntegrationData()
         E_gps,k_gps,f_gps,fint_gps = jax.vmap(compute_at_gauss_point,in_axes=(0,0))(gp_points,gp_weights)
